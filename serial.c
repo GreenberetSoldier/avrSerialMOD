@@ -99,6 +99,9 @@
 #define SERIALTXEN  4
 #define SERIALUDRIE 5
 #define SERIALUDRE  6
+#define SERIALUPM0  7
+#define SERIALUPM1  8
+#define SERIALUSBS  9
 
 static uint8_t volatile rxBuffer[UART_COUNT][RX_BUFFER_SIZE];
 static uint8_t volatile txBuffer[UART_COUNT][TX_BUFFER_SIZE];
@@ -118,15 +121,19 @@ uint8_t serialAvailable(void) {
     return UART_COUNT;
 }
 
-void serialInit(uint8_t uart, uint16_t baud) {
-    if (uart >= UART_COUNT) {
+void serialInit(uint8_t uart, uint16_t baud, uint8_t bits, uint8_t parity, uint8_t stopbits) {
+    if ((uart >= UART_COUNT) ||
+        (bits < 5)           ||
+        (bits > 8)           ||  //no 9bit frames allowed currently
+        (parity > 2)         ||  //0: disabled, 1: even parity, 2: odd parity 
+        (stopbits > 2)       ||
+        (stopbits < 1))
         return;
-    }
 
     // Initialize state variables
-    rxRead[uart] = 0;
+    rxRead[uart]  = 0;
     rxWrite[uart] = 0;
-    txRead[uart] = 0;
+    txRead[uart]  = 0;
     txWrite[uart] = 0;
     shouldStartTransmission[uart] = 1;
 
@@ -136,24 +143,58 @@ void serialInit(uint8_t uart, uint16_t baud) {
     rxBufferElements[uart] = 0;
 #endif
 
-    // Default Configuration: 8N1
-    *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUCSZ0])
-            | (1 << serialBits[uart][SERIALUCSZ1]);
+    // Set amount of data bits
+    switch(bits){
+        case 5:
+            //UCSZ1:0 == 0b00
+            break;
+        case 6:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUCSZ0]);
+            break;
+        case 7:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUCSZ1]);
+            break;
+        case 8:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUCSZ1]) | (1 << serialBits[uart][SERIALUCSZ0]);
+            break;
+    }
+
+    // Set parity checking
+    switch(parity){
+        case 0:
+            // UPM1:0 == 0b00
+            break;
+        case 1:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUPM1]);
+            break;
+        case 2:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUPM1]) | (1 << serialBits[uart][SERIALUPM0]);
+            break;
+    }
+    
+    // Set number of stopbits
+    switch (stopbits){
+        case 1: 
+            //USBS == 0;
+            break;
+        case 2:
+            *serialRegisters[uart][SERIALC] = (1 << serialBits[uart][SERIALUSBS]);  
+            break;
+    }
 
     // Set baudrate
 #if SERIALBAUDBIT == 8
-    *serialRegisters[uart][SERIALUBRRH] = (baud >> 8);
-    *serialRegisters[uart][SERIALUBRRL] = baud;
+    *serialRegisters[uart][SERIALUBRRH] = (BRRVALUE(baud) >> 8);
+    *serialRegisters[uart][SERIALUBRRL] =  BRRVALUE(baud);
 #else
-    *serialBaudRegisters[uart] = baud;
+    *serialBaudRegisters[uart] = BRRVALUE(baud);
 #endif
 
     // Enable Interrupts
     *serialRegisters[uart][SERIALB] = (1 << serialBits[uart][SERIALRXCIE]);
 
     // Enable Receiver/Transmitter
-    *serialRegisters[uart][SERIALB] |= (1 << serialBits[uart][SERIALRXEN])
-            | (1 << serialBits[uart][SERIALTXEN]);
+    *serialRegisters[uart][SERIALB] |= (1 << serialBits[uart][SERIALRXEN]) | (1 << serialBits[uart][SERIALTXEN]);
 }
 
 void serialClose(uint8_t uart) {
@@ -194,6 +235,7 @@ void setFlow(uint8_t uart, uint8_t on) {
 
                 // Trigger Interrupt
                 *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
+                // TODO WG: according to the datasheet UDRE is Read-only!!!
             }
         } else {
             // Send XOFF
@@ -207,6 +249,7 @@ void setFlow(uint8_t uart, uint8_t on) {
 
                 // Trigger Interrupt
                 *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
+                // TODO WG: according to the datasheet UDRE is Read-only!!!
             }
         }
 
@@ -220,66 +263,52 @@ void setFlow(uint8_t uart, uint8_t on) {
 // |     Reception     |
 // ---------------------
 
-uint8_t serialHasChar(uint8_t uart) {
-    if (uart >= UART_COUNT) {
-        return 0;
-    }
-
-    if (rxRead[uart] != rxWrite[uart]) {
-        // True if char available
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
 uint8_t serialGetBlocking(uint8_t uart) {
     if (uart >= UART_COUNT) {
         return 0;
     }
 
-    while(!serialHasChar(uart));
+    while (serialRxBufferEmpty(uart));
     return serialGet(uart);
 }
 
 uint8_t serialGet(uint8_t uart) {
-    if (uart >= UART_COUNT) {
+    if ((uart >= UART_COUNT) || (serialRxBufferEmpty(uart))) {
         return 0;
     }
+    // TODO WG: how can the caller know if the buffer was empty or the value of the returned byte was actually zero? 
 
     uint8_t c;
 
-    if (rxRead[uart] != rxWrite[uart]) {
 #ifdef FLOWCONTROL
-        // This should not underflow as long as the receive buffer is not empty
-        rxBufferElements[uart]--;
+    // This should not underflow as long as the receive buffer is not empty
+    rxBufferElements[uart]--;
 
-        if ((flow[uart] == 0) && (rxBufferElements[uart] <= FLOWMARK)) {
-            while (sendThisNext[uart] != 0);
-            sendThisNext[uart] = XON;
-            flow[uart] = 1;
-            if (shouldStartTransmission[uart]) {
-                shouldStartTransmission[uart] = 0;
+    if ((flow[uart] == 0) && (rxBufferElements[uart] <= FLOWMARK)) {
+        while (sendThisNext[uart] != 0);
+        sendThisNext[uart] = XON;
+        flow[uart] = 1;
+        if (shouldStartTransmission[uart]) {
+            shouldStartTransmission[uart] = 0;
 
-                // Enable Interrupt
-                *serialRegisters[uart][SERIALB] |= (1 << serialBits[uart][SERIALUDRIE]);
+            // Enable Interrupt
+            *serialRegisters[uart][SERIALB] |= (1 << serialBits[uart][SERIALUDRIE]);
 
-                // Trigger Interrupt
-                *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
-            }
+            // Trigger Interrupt
+            *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
+            // TODO WG: according to the datasheet UDRE is Read-only!!!
         }
-#endif
-        c = rxBuffer[uart][rxRead[uart]];
-        rxBuffer[uart][rxRead[uart]] = 0;
-        if (rxRead[uart] < (RX_BUFFER_SIZE - 1)) {
-            rxRead[uart]++;
-        } else {
-            rxRead[uart] = 0;
-        }
-        return c;
-    } else {
-        return 0;
     }
+#endif
+    c = rxBuffer[uart][rxRead[uart]];
+    rxBuffer[uart][rxRead[uart]] = 0;
+    if (rxRead[uart] < (RX_BUFFER_SIZE - 1)) {
+        rxRead[uart]++;
+    } else {
+        rxRead[uart] = 0;
+    }
+    return c;
+     
 }
 
 uint8_t serialRxBufferFull(uint8_t uart) {
@@ -296,10 +325,10 @@ uint8_t serialRxBufferEmpty(uint8_t uart) {
         return 0;
     }
 
-    if (rxRead[uart] != rxWrite[uart]) {
-        return 0;
-    } else {
+    if (rxRead[uart] == rxWrite[uart]) {
         return 1;
+    } else {
+        return 0;
     }
 }
 
@@ -333,21 +362,25 @@ void serialWrite(uint8_t uart, uint8_t data) {
 
         // Trigger Interrupt
         *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
+        // TODO WG: according to the datasheet UDRE is Read-only!!!
     }
 }
 
-void serialWriteString(uint8_t uart, const char *data) {
-    if (uart >= UART_COUNT) {
-        return;
+uint16_t serialWriteString(uint8_t uart, const char *data) {
+    
+    uint16_t bytes = 0;
+    
+    if ((uart >= UART_COUNT) || (data == 0)) {
+        return 0;
     }
 
-    if (data == 0) {
-        serialWriteString(uart, "NULL");
-    } else {
-        while (*data != '\0') {
-            serialWrite(uart, *data++);
-        }
+    while (*data != '\0') {
+        serialWrite(uart, *data++);
+        bytes++;
+        // TODO WG: 'bytes' can overflow
     }
+    
+    return bytes;
 }
 
 uint8_t serialTxBufferFull(uint8_t uart) {
@@ -364,10 +397,10 @@ uint8_t serialTxBufferEmpty(uint8_t uart) {
         return 0;
     }
 
-    if (txRead[uart] != txWrite[uart]) {
-        return 0;
-    } else {
+    if (txRead[uart] == txWrite[uart]) {
         return 1;
+    } else {
+        return 0;
     }
 }
 
@@ -376,15 +409,22 @@ uint8_t serialTxBufferEmpty(uint8_t uart) {
 // ----------------------
 
 inline static void serialReceiveInterrupt(uint8_t uart) {
-    rxBuffer[uart][rxWrite[uart]] = *serialRegisters[uart][SERIALDATA];
+    
+    uint8_t C;
+    
+    // Read UDRE in order to clear RXC (Receive Complete) interrupt flag
+    C = *serialRegisters[uart][SERIALDATA];
 
-    // Simply skip increasing the write pointer if the receive buffer is overflowing
+    // Store recieved byte only if rx buffer is not overflowing
     if (!serialRxBufferFull(uart)) {
+        rxBuffer[uart][rxWrite[uart]] = C;
         if (rxWrite[uart] < (RX_BUFFER_SIZE - 1)) {
             rxWrite[uart]++;
         } else {
             rxWrite[uart] = 0;
         }
+    } else {
+        // Do nothing if the receive buffer is overflowing
     }
 
 #ifdef FLOWCONTROL
@@ -403,6 +443,7 @@ inline static void serialReceiveInterrupt(uint8_t uart) {
 
             // Trigger Interrupt
             *serialRegisters[uart][SERIALA] |= (1 << serialBits[uart][SERIALUDRE]);
+            // TODO WG: according to the datasheet UDRE is Read-only!!!
         }
     }
 #endif
@@ -415,7 +456,7 @@ inline static void serialTransmitInterrupt(uint8_t uart) {
         sendThisNext[uart] = 0;
     } else {
 #endif
-        if (txRead[uart] != txWrite[uart]) {
+        if (!serialTxBufferEmpty(uart)) {
             *serialRegisters[uart][SERIALDATA] = txBuffer[uart][txRead[uart]];
             if (txRead[uart] < (TX_BUFFER_SIZE -1)) {
                 txRead[uart]++;

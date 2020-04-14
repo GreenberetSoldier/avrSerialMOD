@@ -43,7 +43,7 @@
 int main(void) {
     // Initialize UART modules
     for (int i = 0; i < serialAvailable(); i++) {
-        serialInit(i, BAUD(38400, F_CPU));
+        serialInit(i, 9600u, 8, 0, 1);
     }
 
     // Enable Interrupts
@@ -59,7 +59,7 @@ int main(void) {
     // Wait for incoming bytes
     for(;;) {
         for (int i = 0; i < serialAvailable(); i++) {
-            if (serialHasChar(i)) {
+            if (!serialRxBufferEmpty(i)) {
                 serialWrite(i, serialGet(i));
             }
         }

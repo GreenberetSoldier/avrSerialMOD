@@ -41,8 +41,10 @@
  *  UART Library Header File
  */
 
-/** Calculate Baudrate Register Value */
-#define BAUD(baudRate,xtalCpu) ((xtalCpu) / ((baudRate) * 16l) - 1)
+/** Calculate Baudrate Register Value
+ *  F_CPU definition assumed
+ */
+#define BRRVALUE(baudrate) (((((F_CPU) / 16) + ((baudrate) / 2)) / (baudrate)) - 1)
 
 /** Get number of available UART modules.
  *  \returns number of modules
@@ -53,7 +55,7 @@ uint8_t serialAvailable(void);
  *  \param uart UART Module to initialize
  *  \param baud Baudrate. Use the BAUD() macro!
  */
-void serialInit(uint8_t uart, uint16_t baud);
+void serialInit(uint8_t uart, uint16_t baud, uint8_t bits, uint8_t parity, uint8_t twostopbits);
 
 /** Stop the UART Hardware.
  *  \param uart UART Module to stop
@@ -67,15 +69,9 @@ void serialClose(uint8_t uart);
  */
 void setFlow(uint8_t uart, uint8_t on);
 
-/** Check if a byte was received.
- *  \param uart UART Module to check
- *  \returns 1 if a byte was received, 0 if not
- */
-uint8_t serialHasChar(uint8_t uart);
-
 /** Read a single byte.
  *  \param uart UART Module to read from
- *  \returns Received byte or 0
+ *  \returns Oldest received byte or 0
  */
 uint8_t serialGet(uint8_t uart);
 
@@ -106,8 +102,9 @@ void serialWrite(uint8_t uart, uint8_t data);
 /** Send a string.
  *  \param uart UART Module to write to
  *  \param data Null-Terminated String
+ *  \returns number of bytes written
  */
-void serialWriteString(uint8_t uart, const char *data);
+uint16_t serialWriteString(uint8_t uart, const char *data);
 
 /** Check if the transmit buffer is full.
  *  \param uart UART Module to check
